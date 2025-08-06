@@ -1,0 +1,15 @@
+# Abaikan file yang berisi kunci API dan variabel lingkungan
+.env
+
+# Abaikan file konfigurasi yang mungkin berisi data sensitif
+config.py
+
+# Abaikan file yang berisi data jadwal, yang mungkin bersifat lokal atau sementara
+jadwal.json
+
+# --- Tambahan yang Direkomendasikan untuk Proyek Python ---
+# Folder cache yang dibuat oleh Python
+__pycache__/
+
+# File bytecode Python
+*.pyc
