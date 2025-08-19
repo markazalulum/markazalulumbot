@@ -1,0 +1,88 @@
+{
+    "monday": [
+        {
+            "waktu": "20:15",
+            "pelajaran": "Fiqh Muamalah I",
+            "pengajar": "Prof Dr Ahmad As Syaikh",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/1QrCfy0GTPQZQ2mnlr7IIazf7Apo0fJSK?usp=drive_link"
+        }
+    ],
+    "tuesday": [
+        {
+            "waktu": "20:15",
+            "pelajaran": "Fiqh Mawarist",
+            "pengajar": "Dr Sulaiman al Khamis",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/17KPF7gsw9YFx32_Vcwr69mB1VA7fVw3R?usp=drive_link"
+        }
+    ],
+    "wednesday": [
+        {
+            "waktu": "20:15",
+            "pelajaran": "Ulumul Hadist",
+            "pengajar": "Dr Kholid bin Abdul Qodir al Ghomidy",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/1r4kHe6CmP_dDp_Ptgq-Au9HjRVldmAd4?usp=drive_link"
+        }
+    ],
+    "thursday": [
+        {
+            "waktu": "13:30",
+            "pelajaran": "Aqidah al-Washitiyah",
+            "pengajar": "Dr Kholid Al Juhani",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/16-44QsZSn7etZ9fY7cZUNSZZofCdzxJ2?usp=drive_link"
+        },
+        {
+            "waktu": "21:30",
+            "pelajaran": "Fiqh Muamalah II",
+            "pengajar": "Dr Muhammad bin Hail Al Madhaji",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/1TVnZmGJ7neo8G7syvs9kGUlVSGioTrOq?usp=drive_link"
+        }
+    ],
+    "friday": [
+        {
+            "waktu": "20:15",
+            "pelajaran": "Madzhahib Muashiroh",
+            "pengajar": "Prof Dr Muhammad Said Hamid al Madsah",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/18gIlM0ggQLkK2dZazQ21L-XUVBkk3NcG?usp=drive_link"
+        }
+    ],
+    "saturday": [
+        {
+            "waktu": "13:30",
+            "pelajaran": "Fiqh Munakahat",
+            "pengajar": "Dr Anas Wahid Bali",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/10dJmaExLRaNgQeV8xbcnW0roMs7yFGqS?usp=drive_link"
+        },
+        {
+            "waktu": "20:15",
+            "pelajaran": "Qawaidh Fiqhiyyah",
+            "pengajar": "Dr Rasyid Muhsin Abdullah al Luhian",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "tersedia",
+            "drive_link": "https://drive.google.com/drive/folders/1OoTPB6lug8EmaTyKz35HZpprRtwkbCqn?usp=drive_link"
+        }
+    ],
+    "sunday": [
+        {
+            "waktu": "20:15",
+            "pelajaran": "Ulumul Qur'an",
+            "pengajar": "Dr Muhammad al Faqih al Ghomidy",
+            "link": "https://telkomsel.zoom.us/j/93143637811?pwd=Gi7SpSCfmpvR3LDMHiDMKzG7iL9hVk.1",
+            "status": "ditunda",
+            "drive_link": "https://drive.google.com/drive/folders/1CfvVkzTTZmvfY1Ej1ERr9am3IaPk-3_W?usp=drive_link"
+        }
+    ]
+}

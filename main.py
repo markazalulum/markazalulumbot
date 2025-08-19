@@ -1,0 +1,732 @@
+from dotenv import load_dotenv
+load_dotenv() # Memuat variabel dari .env
+import logging
+from datetime import datetime, timedelta
+import pytz
+import re
+import json
+import os
+import config
+from config import TOKEN, CHANNEL_ID, ADMIN_USER_ID, UNIVERSAL_ZOOM_LINK, DRIVE_LINK, MESSAGE_TEXT
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, constants, BotCommand, Bot
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# Setup logging untuk melihat setiap aksi bot
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# --- Konfigurasi Bot (Membaca dari file config.py) ---
+TOKEN = config.TOKEN
+ADMIN_USER_ID = config.ADMIN_USER_ID
+UNIVERSAL_ZOOM_LINK = config.UNIVERSAL_ZOOM_LINK
+DRIVE_LINK = config.DRIVE_LINK
+
+# Kamus untuk menerjemahkan nama hari dari bahasa Inggris ke Indonesia
+hari_mapping = {
+    "monday": "Senin",
+    "tuesday": "Selasa",
+    "wednesday": "Rabu",
+    "thursday": "Kamis",
+    "friday": "Jumat",
+    "saturday": "Sabtu",
+    "sunday": "Ahad"
+}
+
+# Jadwal pelajaran untuk setiap hari.
+jadwal_path = 'jadwal.json'
+
+try:
+    with open(jadwal_path, 'r', encoding='utf-8') as f:
+        jadwal_pelajaran = json.load(f)
+except FileNotFoundError:
+    logging.error(
+        f"File '{jadwal_path}' tidak ditemukan. Pastikan file tersebut ada di direktori yang benar."
+    )
+    jadwal_pelajaran = {}
+except json.JSONDecodeError:
+    logging.error(
+        f"Terjadi kesalahan saat membaca file '{jadwal_path}'. Pastikan formatnya benar."
+    )
+    jadwal_pelajaran = {}
+
+# --- Fungsi kustom untuk meng-escape MarkdownV2 ---
+def escape_markdown_v2(text: str) -> str:
+    """Fungsi untuk meng-escape semua karakter khusus MarkdownV2."""
+    special_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(special_chars)}])', r'\\\1', str(text))
+
+
+# --- FUNGSI PEMBANTU (Refactoring) ---
+async def send_or_edit_message(update: Update,
+                               text: str,
+                               reply_markup: InlineKeyboardMarkup = None):
+    """
+    Fungsi pembantu untuk mengirim pesan baru atau mengedit pesan yang sudah ada
+    berdasarkan jenis pembaruan (pesan teks atau klik tombol).
+    """
+    try:
+        # Menangani kasus ketika update adalah CallbackQuery
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.message.edit_text(
+                text,
+                parse_mode=constants.ParseMode.MARKDOWN_V2,
+                reply_markup=reply_markup
+            )
+        # Menangani kasus ketika update adalah Message (misal dari command langsung)
+        elif update.message:
+            await update.message.reply_text(
+                text,
+                parse_mode=constants.ParseMode.MARKDOWN_V2,
+                reply_markup=reply_markup
+            )
+        else:
+            logging.warning(
+                "send_or_edit_message called without valid update.message or update.callback_query.message."
+            )
+    except Exception as e:
+        logging.error(f"Gagal mengirim atau mengedit pesan: {e}")
+        # Fallback: jika edit gagal (misal pesan terlalu lama atau sudah diedit), coba kirim pesan baru
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.message.reply_text(
+                "Maaf, terjadi kesalahan saat memproses permintaan Anda, mungkin pesan terlalu lama untuk diedit. Berikut hasilnya sebagai pesan baru:",
+                parse_mode=constants.ParseMode.MARKDOWN_V2,
+                reply_markup=None # Tanpa markup untuk fallback ini
+            )
+            # Kirim pesan asli yang gagal diedit sebagai pesan baru
+            await update.callback_query.message.reply_text(
+                text,
+                parse_mode=constants.ParseMode.MARKDOWN_V2,
+                reply_markup=reply_markup
+            )
+        elif update.message:
+            await update.message.reply_text(
+                "Maaf, terjadi kesalahan saat memproses permintaan Anda.")
+        logging.error(f"Error dalam send_or_edit_message: {e}", exc_info=True)
+
+
+async def send_message_to_channel(message_text: str,
+                                   reply_markup: InlineKeyboardMarkup = None):
+    """
+    Fungsi ini menginisialisasi bot dan mengirimkan pesan ke channel
+    yang sudah ditentukan dalam config.CHANNEL_ID.
+    """
+    try:
+        bot = Bot(token=config.TOKEN) # Buat instance bot menggunakan token dari config.TOKEN
+        await bot.send_message(
+            chat_id=config.CHANNEL_ID, # Menggunakan CHANNEL_ID dari config.py
+            text=message_text,
+            parse_mode=constants.ParseMode.MARKDOWN_V2,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True # Mematikan preview link agar tampilan pesan lebih rapi
+        )
+        logging.info("Pesan berhasil dikirim ke channel.")
+    except Exception as e:
+        logging.error(f"Gagal mengirim pesan ke channel: {e}", exc_info=True)
+
+
+# --- FUNGSI SCHEDULER (untuk pengingat otomatis) ---
+async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Memeriksa jadwal pelajaran dan mengirimkan pengingat 60 menit sebelum kelas dimulai
+    dan saat kelas dimulai.
+    """
+    logging.info("Menjalankan pemeriksaan pengingat jadwal...")
+    jakarta_tz = pytz.timezone('Asia/Jakarta')
+    now = datetime.now(jakarta_tz)
+    today_name_en = now.strftime('%A').lower()  # e.g., 'monday', 'tuesday'
+
+    try:
+        # Menggunakan jadwal_pelajaran yang sudah dimuat secara global
+        jadwal_data = jadwal_pelajaran
+    except Exception as e: # Catch any error if jadwal_pelajaran is not loaded
+        logging.error(f"Gagal mengakses jadwal_pelajaran global: {e}")
+        return
+
+    jadwal_hari_ini_list = [
+        item for item in jadwal_data.get(today_name_en, [])
+        if item.get('status') == 'tersedia'
+    ]
+
+    for item in jadwal_hari_ini_list:
+        try:
+            # Menggunakan .get() dengan default kosong untuk menghindari KeyError
+            waktu_str_raw = item.get('waktu', '')
+            if not waktu_str_raw: # Skip if waktu is empty
+                logging.warning(f"Jadwal dengan waktu kosong dilewati: {item}")
+                continue
+
+            # Ambil hanya HH:MM jika ada " WIB"
+            waktu_parts = waktu_str_raw.split(' ')
+            waktu_str = waktu_parts[0]
+
+            jam, menit = map(int, waktu_str.split(':'))
+
+            # Buat objek datetime untuk waktu pelajaran hari ini
+            class_time = now.replace(hour=jam,
+                                     minute=menit,
+                                     second=0,
+                                     microsecond=0)
+
+            # Hitung waktu pengingat (60 menit sebelum)
+            reminder_time_60_min = class_time - timedelta(minutes=60)
+
+            # Hitung waktu pengingat (saat kelas dimulai)
+            reminder_time_at_start = class_time
+
+            # Gunakan context.bot_data untuk melacak pengingat yang sudah dikirim
+            # Ini akan reset setiap kali bot di-restart
+            reminder_key_60_min = f"sent_60_min_{today_name_en}_{item.get('pelajaran','')}_{item.get('waktu','')}"
+            reminder_key_at_start = f"sent_at_start_{today_name_en}_{item.get('pelajaran','')}_{item.get('waktu','')}"
+
+            # Escape dynamic content once at the beginning of the loop,
+            # so it's available for both 60-min and at-start reminders.
+            escaped_pelajaran = escape_markdown_v2(item.get('pelajaran', ''))
+            escaped_pengajar = escape_markdown_v2(item.get('pengajar', ''))
+            escaped_waktu = escape_markdown_v2(item.get('waktu', ''))
+
+            # Cek apakah pengingat 60 menit sebelum sudah waktunya
+            # dan berada dalam jendela 1 menit dari waktu pengingat, dan belum dikirim
+            if (now >= reminder_time_60_min
+                    and now < reminder_time_60_min + timedelta(minutes=1)
+                    and not context.bot_data.get(reminder_key_60_min)):
+
+                reminder_message = (
+                    "� *INFO JADWAL*\n\n"
+                    f"📚 **Pelajaran:** {escaped_pelajaran}\n"
+                    f"🎙️ *Pengajar:* *{escaped_pengajar}*\n"
+                    f"⏰ **Waktu:** {escaped_waktu} WIB\n\n"
+                    "Kelas akan dimulai 60 menit lagi\\. Siapkan waktu dan catatan, anda dapat bergabung melalui tautan di bawah ini\\."
+                )
+
+                lesson_buttons = []
+                # Tambahkan tombol Zoom
+                link_to_use = item.get('link', UNIVERSAL_ZOOM_LINK) # Gunakan UNIVERSAL_ZOOM_LINK global
+                lesson_buttons.append(
+                    InlineKeyboardButton(f"🔗 Gabung Zoom: {escaped_pelajaran}",
+                                         url=link_to_use))
+
+                # Tambahkan tombol Materi jika ada drive_link spesifik atau gunakan DRIVE_LINK universal
+                material_link_to_use = item.get('drive_link', DRIVE_LINK) # Gunakan DRIVE_LINK global
+                lesson_buttons.append(
+                    InlineKeyboardButton(f"📚 Materi: {escaped_pelajaran}",
+                                         url=material_link_to_use))
+                reply_markup = InlineKeyboardMarkup([lesson_buttons])
+
+                await send_message_to_channel(reminder_message, reply_markup)
+                context.bot_data[reminder_key_60_min] = True
+                logging.info(
+                    f"Pengingat 60 menit untuk '{item.get('pelajaran','')}' berhasil dikirim."
+                )
+
+            # Cek apakah pengingat saat kelas dimulai sudah waktunya
+            # dan berada dalam jendela 1 menit dari waktu pengingat, dan belum dikirim
+            if (now >= reminder_time_at_start
+                    and now < reminder_time_at_start + timedelta(minutes=1)
+                    and not context.bot_data.get(reminder_key_at_start)):
+
+                reminder_message = (
+                    "🎉 *KELAS DIMULAI SEKARANG \\!* 🎉\n\n"
+                    f"📚 *Pelajaran :* {escaped_pelajaran}\n"
+                    f"🎙️ *Pengajar :* *{escaped_pengajar}*\n"
+                    f"⏰ *Waktu :* {escaped_waktu} WIB\n\n"
+                    f"Kelas {escaped_pelajaran} sudah dimulai\\. Ayo bergabung sekarang\\!"
+                )
+
+                lesson_buttons = []
+                # Tambahkan tombol Zoom
+                link_to_use = item.get('link', UNIVERSAL_ZOOM_LINK) # Gunakan UNIVERSAL_ZOOM_LINK global
+                lesson_buttons.append(
+                    InlineKeyboardButton(f"🔗 Gabung Zoom: {escaped_pelajaran}",
+                                         url=link_to_use))
+
+                # Tambahkan tombol Materi jika ada drive_link spesifik atau gunakan DRIVE_LINK universal
+                material_link_to_use = item.get('drive_link', DRIVE_LINK) # Gunakan DRIVE_LINK global
+                lesson_buttons.append(
+                    InlineKeyboardButton(f"📚 Materi: {escaped_pelajaran}",
+                                         url=material_link_to_use))
+                reply_markup = InlineKeyboardMarkup([lesson_buttons])
+
+                await send_message_to_channel(reminder_message, reply_markup)
+                context.bot_data[reminder_key_at_start] = True
+                logging.info(
+                    f"Pengingat 'kelas dimulai' untuk '{item.get('pelajaran','')}' berhasil dikirim."
+                )
+
+        except ValueError as ve:
+            logging.error(
+                f"Format waktu tidak valid untuk jadwal: {item}. Error: {ve}")
+        except Exception as e:
+            logging.error(
+                f"Error saat memeriksa atau mengirim pengingat untuk jadwal: {item}. Error: {e}",
+                exc_info=True)
+
+
+# --- FUNGSI send_test_message ---
+async def send_test_message(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
+    """Mengirim pesan percobaan ke channel saat perintah /sendtest diterima."""
+    test_message_content = config.MESSAGE_TEXT
+
+    if update.message:
+        await update.message.reply_text(
+            "Mencoba mengirim pesan percobaan ke channel...")
+
+    try:
+        await send_message_to_channel(test_message_content)
+        if update.message:
+            await update.message.reply_text(
+                "✅ Pesan percobaan berhasil dikirim ke channel!")
+    except Exception as e:
+        if update.message:
+            await update.message.reply_text(
+                f"❌ Gagal mengirim pesan ke channel: {str(e)}")
+        logging.error(f"Error in send_test_message: {e}", exc_info=True)
+
+
+# --- HANDLER PERINTAH (COMMAND HANDLERS) ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fungsi yang akan dijalankan saat perintah /start dikirim."""
+    user = update.effective_user
+    user_first_name = "Pengguna"
+    if user and user.first_name:
+        user_first_name = escape_markdown_v2(user.first_name)
+
+    welcome_text = (
+        f"Assalamu'alaikum, ***Markaz Darasatul Ulum al\\-Syar'iyyah***\n\n"
+        f"Selamat datang di Bot Markaz Al Ulum\\. Bot ini akan membantu Anda mendapatkan informasi terkait Markaz al Ulum\\.\n\n"
+        f"Silakan pilih opsi di bawah untuk memulai:")
+
+    keyboard = [[
+        InlineKeyboardButton("🗓️ Jadwal Hari Ini",
+                             callback_data='jadwal_hari_ini')
+    ],
+                [
+                    InlineKeyboardButton(
+                        "▶️ Saluran YouTube",
+                        url='https://www.youtube.com/@markazalulum'),
+                    InlineKeyboardButton("📝 Daftar",
+                                         url='https://wa.me/markazalulum')
+                ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await send_or_edit_message(update, welcome_text, reply_markup)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menampilkan panduan penggunaan dan tautan penting."""
+    help_text = (
+        "***Panduan Penggunaan Bot Markaz Al Ulum***\n\n"
+        "Anda bisa menggunakan perintah di bawah ini untuk berinteraksi dengan bot:\n\n"
+        "• /start: Untuk mendapatkan pesan sambutan dan menu utama bot\\.\n"
+        "• /help: Untuk melihat panduan ini\\.\n"
+        "• /jadwal: Untuk melihat seluruh jadwal pelajaran setiap pekan\\.\n"
+        "• /jadwal\\_hari\\_ini: Untuk melihat jadwal pelajaran khusus hari ini saja\\.\n"
+        "• /cari: Untuk mencari jadwal berdasarkan kata kunci\\. Contoh: `/cari Sulaiman` atau `/cari Fiqh`\\.\n"
+        "• /tautan: Untuk melihat semua tautan penting\\.\n\n"
+        "***Tautan Penting***")
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Pendaftaran",
+                                 url='https://wa.me/markazalulum')
+        ],
+        [
+            InlineKeyboardButton("▶️ Saluran YouTube",
+                                 url='https://www.youtube.com/@markazalulum')
+        ], [InlineKeyboardButton("📚 Materi & Rekaman", url=config.DRIVE_LINK)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await send_or_edit_message(update, help_text, reply_markup)
+
+
+async def tautan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fungsi baru untuk menampilkan semua tautan penting."""
+    tautan_text = "**Tautan Penting**"
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Pendaftaran",
+                                 url='https://wa.me/markazalulum')
+        ],
+        [
+            InlineKeyboardButton("▶️ Saluran YouTube",
+                                 url='https://www.youtube.com/@markazalulum')
+        ],
+        [InlineKeyboardButton("📚 Materi dan Rekaman", url=config.DRIVE_LINK)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await send_or_edit_message(update, tautan_text, reply_markup)
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mencari jadwal berdasarkan kata kunci dari file jadwal.json."""
+    if not context.args:
+        await send_or_edit_message(
+            update,
+            "Mohon berikan kata kunci pencarian\\. Contoh: `/cari Sulaiman` atau `/cari Fiqh`\\."
+        )
+        return
+
+    search_query = " ".join(context.args).lower()
+    search_results = {}
+    found = False
+
+    try:
+        jadwal_data = jadwal_pelajaran
+
+        # Cek apakah kata kunci pencarian adalah nama hari
+        hari_terpilih = None
+        for hari_en, hari_id in hari_mapping.items():
+            if search_query == hari_en.lower() or search_query == hari_id.lower():
+                hari_terpilih = hari_en
+                break
+
+        if hari_terpilih:
+            hari_id_display = hari_mapping.get(hari_terpilih, hari_terpilih.capitalize())
+            jadwal_list = jadwal_data.get(hari_terpilih, [])
+            if jadwal_list:
+                search_results[hari_id_display] = jadwal_list # Store with Indonesian day name
+                found = True
+        else:
+            for hari_en, jadwal_list in jadwal_data.items():
+                matches = []
+                for item in jadwal_list:
+                    pelajaran_str = str(item.get('pelajaran', '')).lower()
+                    pengajar_str = str(item.get('pengajar', '')).lower()
+                    status_str = str(item.get('status', '')).lower()
+
+                    if (search_query in pelajaran_str
+                            or search_query in pengajar_str
+                            or search_query in status_str):
+                        matches.append(item)
+                        found = True
+
+                if matches:
+                    hari_id_display = hari_mapping.get(hari_en, hari_en.capitalize())
+                    search_results[hari_id_display] = matches # Store with Indonesian day name
+
+        if not found:
+            await send_or_edit_message(
+                update,
+                f"Tidak ada jadwal yang ditemukan dengan kata kunci '`{escape_markdown_v2(search_query)}`'\\."
+            )
+            return
+
+        # Initial response for search_command (header)
+        initial_message_text = f"**Hasil Pencarian untuk '`{escape_markdown_v2(search_query)}`'**\n\n"
+        target_chat_id = None
+
+        if update.callback_query and update.callback_query.message:
+            # If triggered by a callback, edit the original message with the header
+            await update.callback_query.message.edit_text(
+                initial_message_text,
+                parse_mode=constants.ParseMode.MARKDOWN_V2
+            )
+            target_chat_id = update.callback_query.message.chat_id
+        elif update.message:
+            # If triggered by a command, reply with the header
+            await update.message.reply_text(
+                initial_message_text,
+                parse_mode=constants.ParseMode.MARKDOWN_V2
+            )
+            target_chat_id = update.message.chat_id
+        else:
+            logging.warning("search_command called without valid update.message or update.callback_query. Cannot send results.")
+            return # Exit if we don't have a chat to send to
+
+        # Iterate and send each lesson as a separate message with its buttons
+        for hari_display, matches in search_results.items(): # Use hari_display from search_results
+            # Always print the day header for each group of matches as a new message
+            # This ensures the day is always displayed for each result group.
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=f"*{hari_display}*\n",
+                parse_mode=constants.ParseMode.MARKDOWN_V2
+            )
+
+            for item in matches:
+                status_icon = "✅" if item.get('status', '') == "tersedia" else "❌"
+                pelajaran = escape_markdown_v2(item.get('pelajaran', ''))
+                pengajar = escape_markdown_v2(item.get('pengajar', ''))
+                waktu = escape_markdown_v2(item.get('waktu', ''))
+                status = escape_markdown_v2(item.get('status', ''))
+
+                message_text = (
+                    f"• {status_icon} *{pelajaran}* bersama _{pengajar}_\n"
+                    f"  Pukul: *{waktu}* WIB\n"
+                    f"  Status: *{status}*\n"
+                )
+
+                lesson_buttons = []
+                zoom_link = item.get('link', UNIVERSAL_ZOOM_LINK)
+                lesson_buttons.append(InlineKeyboardButton(f"🔗 Gabung Zoom: {pelajaran}", url=zoom_link))
+
+                material_link = item.get('drive_link', DRIVE_LINK)
+                lesson_buttons.append(InlineKeyboardButton(f"📚 Materi: {pelajaran}", url=material_link))
+
+                reply_markup = None
+                if lesson_buttons:
+                    reply_markup = InlineKeyboardMarkup([lesson_buttons])
+
+                # Send each lesson as a new message (not editing the same one repeatedly)
+                await context.bot.send_message(
+                    chat_id=target_chat_id,
+                    text=message_text,
+                    parse_mode=constants.ParseMode.MARKDOWN_V2,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+
+    except FileNotFoundError:
+        await send_or_edit_message(update, "Maaf, file jadwal tidak ditemukan\\.")
+    except Exception as e:
+        logging.error(f"Error saat memproses perintah /cari: {e}", exc_info=True)
+        await send_or_edit_message(
+            update,
+            f"Terjadi kesalahan saat memproses pencarian Anda: {escape_markdown_v2(str(e))}"
+        )
+
+
+async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fungsi untuk menampilkan seluruh jadwal pelajaran tanpa memfilter status."""
+    try:
+        jadwal_text_parts = [
+            "***🗓️ Seluruh Jadwal Pelajaran Setiap Pekan***", ""
+        ]
+        hari_indo = {
+            'monday': 'Senin',
+            'tuesday': 'Selasa',
+            'wednesday': 'Rabu',
+            'thursday': 'Kamis',
+            'friday': 'Jumat',
+            'saturday': 'Sabtu',
+            'sunday': 'Minggu'
+        }
+
+        for hari, jadwal_list in jadwal_pelajaran.items():
+            if jadwal_list:
+                hari_display = hari_indo.get(hari, hari.capitalize())
+                jadwal_text_parts.append(f"***{hari_display}***:")
+                for item in jadwal_list:
+                    waktu = item.get('waktu', '')
+                    pelajaran = item.get('pelajaran', '')
+                    pengajar = item.get('pengajar', '')
+                    status = item.get('status', 'tersedia')
+
+                    jadwal_line = (
+                        f"\\- ***{escape_markdown_v2(waktu)}***: "
+                        f"{escape_markdown_v2(pelajaran)} "
+                        f"_\\(Pengajar: {escape_markdown_v2(pengajar)}\\)_"
+                    )
+                    if status == 'ditunda':
+                        jadwal_line += " _\\(DITUNDA\\)_"
+
+                    jadwal_text_parts.append(jadwal_line)
+                jadwal_text_parts.append("")
+
+        jadwal_text = "\n".join(jadwal_text_parts)
+
+        keyboard = [[
+            InlineKeyboardButton("Lihat Jadwal Hari Ini",
+                                 callback_data='jadwal_hari_ini')
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await send_or_edit_message(update, jadwal_text, reply_markup)
+    except Exception as e:
+        logging.error(f"Error in /jadwal: {e}", exc_info=True)
+        error_text = "Terjadi kesalahan saat memproses jadwal. Mohon coba lagi nanti."
+        await send_or_edit_message(update, error_text)
+
+
+async def jadwal_hari_ini(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fungsi untuk menampilkan jadwal pelajaran hari ini yang statusnya 'tersedia'."""
+    jakarta_tz = pytz.timezone('Asia/Jakarta')
+    now = datetime.now(jakarta_tz)
+    today = now.strftime('%A').lower()
+
+    hari_indo = {
+        'monday': 'Senin',
+        'tuesday': 'Selasa',
+        'wednesday': 'Rabu',
+        'thursday': 'Kamis',
+        'friday': 'Jumat',
+        'saturday': 'Sabtu',
+        'sunday': 'Minggu'
+    }
+    today_indo = hari_indo.get(today, 'Hari ini')
+
+    jadwal_hari_ini_text_lines = [
+        f"**🗓️ Jadwal Pelajaran Hari {today_indo}**", ""
+    ]
+
+    keyboard_buttons_per_lesson = []
+
+    if today in jadwal_pelajaran:
+        jadwal_tersedia = [
+            item for item in jadwal_pelajaran[today]
+            if item.get('status', 'tersedia') == 'tersedia'
+        ]
+
+        if jadwal_tersedia:
+            for item in jadwal_tersedia:
+                waktu = item.get('waktu', '')
+                pelajaran = item.get('pelajaran', '')
+                pengajar = item.get('pengajar', '')
+
+                jadwal_hari_ini_text_lines.append(
+                    f"**{escape_markdown_v2(waktu)}**")
+                jadwal_hari_ini_text_lines.append(
+                    f"📚 **Pelajaran:** {escape_markdown_v2(pelajaran)}")
+                jadwal_hari_ini_text_lines.append(
+                    f"🎙️ **Pengajar:** {escape_markdown_v2(pengajar)}")
+                jadwal_hari_ini_text_lines.append("")
+
+                lesson_buttons = []
+                if 'link' in item:
+                    zoom_link_text = escape_markdown_v2(item.get('pelajaran', ''))
+                    lesson_buttons.append(
+                        InlineKeyboardButton(
+                            f"🔗 Gabung Zoom: {zoom_link_text}",
+                            url=item['link']))
+
+                if 'drive_link' in item and item['drive_link']:
+                    drive_link_text = escape_markdown_v2(item.get('pelajaran', ''))
+                    lesson_buttons.append(
+                        InlineKeyboardButton(f"📚 Materi: {drive_link_text}",
+                                             url=item['drive_link']))
+
+                if lesson_buttons:
+                    keyboard_buttons_per_lesson.append(
+                        lesson_buttons
+                    )
+        else:
+            jadwal_hari_ini_text_lines.append(
+                "Tidak ada jadwal pelajaran untuk hari ini\\.")
+    else:
+        jadwal_hari_ini_text_lines.append(
+            "Tidak ada jadwal pelajaran untuk hari ini\\.")
+
+    jadwal_hari_ini_text = "\n".join(jadwal_hari_ini_text_lines)
+
+    reply_markup = InlineKeyboardMarkup(keyboard_buttons_per_lesson)
+
+    await send_or_edit_message(update, jadwal_hari_ini_text, reply_markup)
+
+
+async def handle_callback_query(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE):
+    """Fungsi untuk menangani klik tombol dari inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'start':
+        await start(update, context)
+    elif query.data == 'help':
+        await help_command(update, context)
+    elif query.data == 'jadwal':
+        await jadwal(update, context)
+    elif query.data == 'jadwal_hari_ini':
+        await jadwal_hari_ini(update, context)
+    elif query.data == 'tautan':
+        await tautan(update, context)
+    elif query.data == 'cari':
+        # Untuk callback 'cari', kita panggil search_command tanpa args
+        # Ini berarti bot akan meminta kata kunci pencarian.
+        # Jika Anda ingin callback 'cari' langsung memicu pencarian tertentu,
+        # Anda perlu memodifikasi logic di sini atau menambahkan data ke query.data
+        await search_command(update, context)
+
+
+async def post_init(application: Application):
+    """Fungsi yang berjalan setelah bot terinisialisasi untuk mengatur menu."""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Memulai interaksi dengan bot"),
+        BotCommand("help", "Menampilkan panduan penggunaan bot"),
+        BotCommand("jadwal", "Menampilkan seluruh jadwal pelajaran"),
+        BotCommand("jadwal_hari_ini", "Menampilkan jadwal untuk hari ini"),
+        BotCommand("tautan", "Menampilkan semua tautan penting"),
+        BotCommand("cari",
+                   "Menampilkan fitur pencarian materi/pemateri/status"),
+        BotCommand("sendtest", "Mengirim pesan percobaan ke channel")
+    ])
+
+    logging.info("Memulai penjadwalan otomatis...")
+    job_queue_instance = application.job_queue
+
+    if job_queue_instance is not None:
+        jakarta_tz = pytz.timezone('Asia/Jakarta')
+        job_queue_instance.run_repeating(check_and_send_reminders,
+                                         interval=60,
+                                         first=datetime.now(jakarta_tz),
+                                         name="daily_reminder_job")
+        logging.info("Penjadwalan otomatis berhasil dimulai.")
+    else:
+        logging.error(
+            "JobQueue tidak tersedia. Fitur pengingat otomatis tidak akan berfungsi."
+        )
+
+
+def main() -> None:
+    """Fungsi utama untuk menjalankan bot."""
+    application = Application.builder().token(
+        config.TOKEN).post_init(post_init).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("jadwal", jadwal))
+    application.add_handler(CommandHandler("jadwal_hari_ini", jadwal_hari_ini))
+    application.add_handler(CommandHandler("tautan", tautan))
+    application.add_handler(CommandHandler("cari", search_command))
+    application.add_handler(
+        CommandHandler("sendtest",
+                       send_test_message,
+                       filters=filters.User(ADMIN_USER_ID)))
+
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # --- PENTING: Ganti run_polling dengan run_webhook untuk Cloud Run ---
+
+    # Path tempat Telegram akan mengirim update (misalnya, yourservice.run.app/webhook)
+    WEBHOOK_PATH = "/webhook"
+
+        # Dapatkan port dari variabel lingkungan yang disediakan oleh Cloud Run
+        # Default ke 8080 jika tidak disetel (ini penting untuk Cloud Run)
+    PORT = int(os.environ.get("PORT", 8080))
+
+        # URL publik yang akan digunakan Telegram untuk mengirim update
+        # Di Cloud Run, URL ini dinamis. Kita akan menyetelnya *setelah* deployment.
+        # PTB akan mendengarkan di `listen_address` dan `port`.
+        # `url_path` adalah bagian path di URL yang akan kita da daftarkan ke Telegram.
+        # `webhook_url` adalah URL LENGKAP yang akan Anda daftarkan ke Telegram.
+        # Di Cloud Run, URL ini didapatkan setelah service di-deploy.
+        # Untuk saat ini, kita bisa membiarkannya kosong karena kita akan menyetelnya secara manual ke Telegram.
+        # PTB hanya perlu tahu *cara mendengarkan* request.
+
+        # Jalankan aplikasi dalam mode webhook
+        # Parameter:
+        #   listen: IP yang akan didengarkan oleh server (0.0.0.0 agar bisa diakses dari luar container)
+        #   port: Port yang akan didengarkan (dari variabel lingkungan Cloud Run)
+        #   url_path: Path di mana bot akan menerima update Telegram (misalnya '/webhook')
+        #   webhook_url: URL lengkap yang akan didaftarkan ke Telegram (kita akan setel ini secara eksternal)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+            # Kita tidak perlu menyetel webhook_url di sini jika akan disetel secara eksternal (disarankan untuk Cloud Run)
+            # Anda akan mengatur URL webhook ke Telegram secara terpisah setelah deployment.
+            # Contoh: https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://[URL-CLOUDRUN-ANDA]/webhook
+    )
+
+if __name__ == '__main__':
+    main()
+

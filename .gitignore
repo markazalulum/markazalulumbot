@@ -1,15 +1,32 @@
-# Abaikan file yang berisi kunci API dan variabel lingkungan
-.env
-
-# Abaikan file konfigurasi yang mungkin berisi data sensitif
-config.py
-
-# Abaikan file yang berisi data jadwal, yang mungkin bersifat lokal atau sementara
-jadwal.json
-
-# --- Tambahan yang Direkomendasikan untuk Proyek Python ---
-# Folder cache yang dibuat oleh Python
+# Python
 __pycache__/
-
-# File bytecode Python
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.env # Penting: ini mengabaikan file .env Anda!
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+.ipynb_checkpoints/ # Untuk pengguna Jupyter Notebook
+
+# Editor
+.vscode/ # Mengabaikan folder konfigurasi VS Code lokal
+.idea/ # Untuk pengguna PyCharm/IntelliJ
+*.swp
+*.bak
+*.swo
+
+# Log dan Database
+*.log
+*.sqlite3
+*.db
+
+# OS
+.DS_Store # macOS
+Thumbs.db # Windows
