@@ -135,21 +135,67 @@ async def send_message_to_channel(message_text: str,
 
 
 # --- FUNGSI SCHEDULER (untuk pengingat otomatis) ---
+# --- FUNGSI PEMBANTU
+async def send_message_to_user(bot_instance, chat_id: int, text: str, reply_markup: InlineKeyboardMarkup = None):
+    """
+    Fungsi pembantu untuk mengirim pesan ke satu pengguna tertentu.
+    """
+    try:
+        await bot_instance.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=constants.ParseMode.MARKDOWN_V2,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+        logger.info(f"Pesan berhasil dikirim ke pengguna: {chat_id}")
+    except Exception as e:
+        logger.error(f"Gagal mengirim pesan ke pengguna {chat_id}: {e}", exc_info=True)
+
 async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
     """
     Memeriksa jadwal pelajaran dan mengirimkan pengingat 60 menit sebelum kelas dimulai
-    dan saat kelas dimulai.
+    dan saat kelas dimulai, baik ke channel maupun ke pelanggan personal.
     """
-    logging.info("Menjalankan pemeriksaan pengingat jadwal...")
+    logger.info("Menjalankan pemeriksaan pengingat jadwal...")
     jakarta_tz = pytz.timezone('Asia/Jakarta')
     now = datetime.now(jakarta_tz)
     today_name_en = now.strftime('%A').lower()  # e.g., 'monday', 'tuesday'
 
+    # Dapatkan instance bot untuk mengirim pesan personal
+    bot_instance = context.bot
+
+    # --- Bagian Baru: Ambil Pelanggan dari Firestore ---
+    subscribed_users = []
+    if db: # Pastikan db client sudah ada
+        try:
+            # Gunakan APP_ID yang diimpor dari config.py
+            # Ini akan mencari data di artifacts/{APP_ID_ANDA}/public/data/users
+            users_ref = db.collection(f'artifacts/{APP_ID}/public/data/users')
+            
+            # Gunakan loop `for` biasa untuk iterasi StreamGenerator (synchronous iteration)
+            docs_stream = users_ref.where('subscribed_to_reminders', '==', True).stream()
+            
+            for doc in docs_stream:
+                user_data = doc.to_dict()
+                if user_data: # Pastikan dokumen tidak kosong
+                    subscribed_users.append(user_data)
+            logger.info(f"Ditemukan {len(subscribed_users)} pelanggan yang aktif.")
+        except Exception as e:
+            logger.error(f"Gagal mengambil daftar pelanggan dari Firestore: {e}", exc_info=True)
+            subscribed_users = []
+    else:
+        logger.warning("Firestore DB client tidak tersedia, tidak dapat mengambil daftar pelanggan.")
+    # --- Akhir Bagian Baru ---
+
     try:
-        # Menggunakan jadwal_pelajaran yang sudah dimuat secara global
+        global jadwal_pelajaran # Deklarasikan sebagai global jika dimodifikasi di tempat lain
         jadwal_data = jadwal_pelajaran
-    except Exception as e: # Catch any error if jadwal_pelajaran is not loaded
-        logging.error(f"Gagal mengakses jadwal_pelajaran global: {e}")
+    except NameError:
+        logger.error("Variabel 'jadwal_pelajaran' tidak ditemukan. Pastikan sudah dimuat.")
+        return
+    except Exception as e:
+        logger.error(f"Gagal mengakses jadwal_pelajaran global: {e}")
         return
 
     jadwal_hari_ini_list = [
@@ -159,118 +205,122 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
 
     for item in jadwal_hari_ini_list:
         try:
-            # Menggunakan .get() dengan default kosong untuk menghindari KeyError
             waktu_str_raw = item.get('waktu', '')
-            if not waktu_str_raw: # Skip if waktu is empty
-                logging.warning(f"Jadwal dengan waktu kosong dilewati: {item}")
+            if not waktu_str_raw:
+                logger.warning(f"Jadwal dengan waktu kosong dilewati: {item}")
                 continue
 
-            # Ambil hanya HH:MM jika ada " WIB"
             waktu_parts = waktu_str_raw.split(' ')
             waktu_str = waktu_parts[0]
 
             jam, menit = map(int, waktu_str.split(':'))
 
-            # Buat objek datetime untuk waktu pelajaran hari ini
-            class_time = now.replace(hour=jam,
-                                     minute=menit,
-                                     second=0,
-                                     microsecond=0)
+            class_time = now.replace(hour=jam, minute=menit, second=0, microsecond=0)
 
-            # Hitung waktu pengingat (60 menit sebelum)
             reminder_time_60_min = class_time - timedelta(minutes=60)
-
-            # Hitung waktu pengingat (saat kelas dimulai)
             reminder_time_at_start = class_time
 
-            # Gunakan context.bot_data untuk melacak pengingat yang sudah dikirim
-            # Ini akan reset setiap kali bot di-restart
             reminder_key_60_min = f"sent_60_min_{today_name_en}_{item.get('pelajaran','')}_{item.get('waktu','')}"
             reminder_key_at_start = f"sent_at_start_{today_name_en}_{item.get('pelajaran','')}_{item.get('waktu','')}"
 
-            # Escape dynamic content once at the beginning of the loop,
-            # so it's available for both 60-min and at-start reminders.
             escaped_pelajaran = escape_markdown_v2(item.get('pelajaran', ''))
             escaped_pengajar = escape_markdown_v2(item.get('pengajar', ''))
             escaped_waktu = escape_markdown_v2(item.get('waktu', ''))
 
-            # Cek apakah pengingat 60 menit sebelum sudah waktunya
-            # dan berada dalam jendela 1 menit dari waktu pengingat, dan belum dikirim
+            lesson_buttons = []
+            link_to_use = item.get('link', UNIVERSAL_ZOOM_LINK)
+            lesson_buttons.append(
+                InlineKeyboardButton(f"🔗 Gabung Zoom: {escaped_pelajaran}", url=link_to_use)
+            )
+            material_link_to_use = item.get('drive_link', DRIVE_LINK)
+            lesson_buttons.append(
+                InlineKeyboardButton(f"📚 Materi: {escaped_pelajaran}", url=material_link_to_use)
+            )
+            reply_markup = InlineKeyboardMarkup([lesson_buttons])
+
+            # --- KIRIM PENGINGAT 60 MENIT SEBELUM ---
             if (now >= reminder_time_60_min
                     and now < reminder_time_60_min + timedelta(minutes=1)
                     and not context.bot_data.get(reminder_key_60_min)):
 
-                reminder_message = (
-                    "� *INFO JADWAL*\n\n"
+                reminder_message_60_min = (
+                    "⏰ *INFO JADWAL*\n\n"
                     f"📚 **Pelajaran:** {escaped_pelajaran}\n"
                     f"🎙️ *Pengajar:* *{escaped_pengajar}*\n"
                     f"⏰ **Waktu:** {escaped_waktu} WIB\n\n"
                     "Kelas akan dimulai 60 menit lagi\\. Siapkan waktu dan catatan, anda dapat bergabung melalui tautan di bawah ini\\."
                 )
+                
+                # Kirim ke Channel
+                if CHANNEL_ID != 0:
+                    await context.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=reminder_message_60_min,
+                        parse_mode=constants.ParseMode.MARKDOWN_V2,
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True
+                    )
+                    logger.info(f"Pengingat 60 menit ke channel {CHANNEL_ID} berhasil dikirim.")
+                else:
+                    logger.warning("CHANNEL_ID tidak valid (0), tidak dapat mengirim pengingat ke channel.")
 
-                lesson_buttons = []
-                # Tambahkan tombol Zoom
-                link_to_use = item.get('link', UNIVERSAL_ZOOM_LINK) # Gunakan UNIVERSAL_ZOOM_LINK global
-                lesson_buttons.append(
-                    InlineKeyboardButton(f"🔗 Gabung Zoom: {escaped_pelajaran}",
-                                         url=link_to_use))
 
-                # Tambahkan tombol Materi jika ada drive_link spesifik atau gunakan DRIVE_LINK universal
-                material_link_to_use = item.get('drive_link', DRIVE_LINK) # Gunakan DRIVE_LINK global
-                lesson_buttons.append(
-                    InlineKeyboardButton(f"📚 Materi: {escaped_pelajaran}",
-                                         url=material_link_to_use))
-                reply_markup = InlineKeyboardMarkup([lesson_buttons])
-
-                await send_message_to_channel(reminder_message, reply_markup)
+                # Kirim ke Pelanggan Personal
+                for user_data in subscribed_users:
+                    user_tg_id = user_data.get('telegram_user_id')
+                    if user_tg_id:
+                        await send_message_to_user(bot_instance, user_tg_id, reminder_message_60_min, reply_markup)
+                
                 context.bot_data[reminder_key_60_min] = True
-                logging.info(
-                    f"Pengingat 60 menit untuk '{item.get('pelajaran','')}' berhasil dikirim."
+                logger.info(
+                    f"Pengingat 60 menit untuk '{item.get('pelajaran','')}' berhasil dikirim ke channel dan {len(subscribed_users)} pelanggan personal."
                 )
 
-            # Cek apakah pengingat saat kelas dimulai sudah waktunya
-            # dan berada dalam jendela 1 menit dari waktu pengingat, dan belum dikirim
+            # --- KIRIM PENGINGAT SAAT KELAS DIMULAI ---
             if (now >= reminder_time_at_start
                     and now < reminder_time_at_start + timedelta(minutes=1)
                     and not context.bot_data.get(reminder_key_at_start)):
 
-                reminder_message = (
+                reminder_message_at_start = (
                     "🎉 *KELAS DIMULAI SEKARANG \\!* 🎉\n\n"
                     f"📚 *Pelajaran :* {escaped_pelajaran}\n"
                     f"🎙️ *Pengajar :* *{escaped_pengajar}*\n"
                     f"⏰ *Waktu :* {escaped_waktu} WIB\n\n"
                     f"Kelas {escaped_pelajaran} sudah dimulai\\. Ayo bergabung sekarang\\!"
                 )
+                # Kirim ke Channel
+                if CHANNEL_ID != 0:
+                    await context.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=reminder_message_at_start,
+                        parse_mode=constants.ParseMode.MARKDOWN_V2,
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True
+                    )
+                    logger.info(f"Pengingat 'kelas dimulai' ke channel {CHANNEL_ID} berhasil dikirim.")
+                else:
+                    logger.warning("CHANNEL_ID tidak valid (0), tidak dapat mengirim pengingat ke channel.")
 
-                lesson_buttons = []
-                # Tambahkan tombol Zoom
-                link_to_use = item.get('link', UNIVERSAL_ZOOM_LINK) # Gunakan UNIVERSAL_ZOOM_LINK global
-                lesson_buttons.append(
-                    InlineKeyboardButton(f"🔗 Gabung Zoom: {escaped_pelajaran}",
-                                         url=link_to_use))
 
-                # Tambahkan tombol Materi jika ada drive_link spesifik atau gunakan DRIVE_LINK universal
-                material_link_to_use = item.get('drive_link', DRIVE_LINK) # Gunakan DRIVE_LINK global
-                lesson_buttons.append(
-                    InlineKeyboardButton(f"📚 Materi: {escaped_pelajaran}",
-                                         url=material_link_to_use))
-                reply_markup = InlineKeyboardMarkup([lesson_buttons])
-
-                await send_message_to_channel(reminder_message, reply_markup)
+                # Kirim ke Pelanggan Personal
+                for user_data in subscribed_users:
+                    user_tg_id = user_data.get('telegram_user_id')
+                    if user_tg_id:
+                        await send_message_to_user(bot_instance, user_tg_id, reminder_message_at_start, reply_markup)
+                
                 context.bot_data[reminder_key_at_start] = True
-                logging.info(
-                    f"Pengingat 'kelas dimulai' untuk '{item.get('pelajaran','')}' berhasil dikirim."
+                logger.info(
+                    f"Pengingat 'kelas dimulai' untuk '{item.get('pelajaran','')}' berhasil dikirim ke channel dan {len(subscribed_users)} pelanggan personal."
                 )
 
         except ValueError as ve:
-            logging.error(
+            logger.error(
                 f"Format waktu tidak valid untuk jadwal: {item}. Error: {ve}")
         except Exception as e:
-            logging.error(
+            logger.error(
                 f"Error saat memeriksa atau mengirim pengingat untuk jadwal: {item}. Error: {e}",
                 exc_info=True)
-
-
+            
 # --- FUNGSI send_test_message ---
 async def send_test_message(update: Update,
                             context: ContextTypes.DEFAULT_TYPE):
