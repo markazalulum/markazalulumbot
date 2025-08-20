@@ -30,3 +30,6 @@ dist/
 # OS
 .DS_Store # macOS
 Thumbs.db # Windows
+
+# Firebase Service Account Key (Jangan pernah di-commit!)
+telegram-bot-markazalulum-firebase-adminsdk-fbsvc-99343d6bba.json

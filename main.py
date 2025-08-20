@@ -1,13 +1,14 @@
+import logging
 from dotenv import load_dotenv
 load_dotenv() # Memuat variabel dari .env
-import logging
 from datetime import datetime, timedelta
 import pytz
 import re
 import json
 import os
 import config
-from config import TOKEN, CHANNEL_ID, ADMIN_USER_ID, UNIVERSAL_ZOOM_LINK, DRIVE_LINK, MESSAGE_TEXT
+from config import db, firebase_admin # Pastikan Anda mengimpor 'db' dari config.py
+from config import TOKEN, CHANNEL_ID, ADMIN_USER_ID, UNIVERSAL_ZOOM_LINK, DRIVE_LINK, MESSAGE_TEXT, FIREBASE_SERVICE_ACCOUNT_KEY_PATH, APP_ID
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, constants, BotCommand, Bot
 from telegram.ext import (
     Application,
@@ -16,12 +17,13 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
 # Setup logging untuk melihat setiap aksi bot
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING) # Mute httpx warnings
+logger = logging.getLogger(__name__) # Definisi logger di sini
 
 # --- Konfigurasi Bot (Membaca dari file config.py) ---
 TOKEN = config.TOKEN
@@ -366,6 +368,122 @@ async def tautan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_or_edit_message(update, tautan_text, reply_markup)
 
+# Fungsi pendaftaran untuk pengingat pribadi
+async def subscribe_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the /subscribe_pengingat command to subscribe a user for reminders."""
+    # Pastikan db sudah berhasil diinisialisasi di config.py
+    if db is None:
+        await update.message.reply_text(
+            "Maaf, bot sedang mengalami masalah teknis (database tidak tersedia). Mohon coba lagi nanti."
+        )
+        logger.error("Database client is not initialized.")
+        return
+
+    user = update.effective_user
+    user_id = str(user.id) # Ensure user ID is a string for Firestore document IDs
+    username = user.full_name or user.username or "Anonim" # Get user's full name, username, or default to "Anonim"
+
+    logger.info(f"Percobaan pendaftaran pengingat oleh pengguna: {username} (ID: {user_id})")
+
+    try:
+        # Dapatkan APP_ID dari config.py juga jika Anda ingin menggunakannya
+        # from config import APP_ID # Tambahkan ini jika APP_ID tidak diakses secara global di sini
+        # Contoh penggunaan APP_ID (pastikan APP_ID diatur di config.py)
+        app_id_from_config = firebase_admin._apps['[DEFAULT]'].name if firebase_admin._apps else 'default-app-id' # Menggunakan nama aplikasi default atau fallback
+        # Atau jika Anda memiliki APP_ID di config.py yang sesuai dengan nama proyek Anda:
+        # from config import APP_ID as config_app_id
+        # user_doc_ref = db.collection(f'artifacts/{config_app_id}/public/data/users').document(user_id)
+        # Jika Anda tidak menggunakan APP_ID spesifik, ini akan disimpan di root 'users' collection
+        
+        # Menggunakan struktur koleksi publik seperti yang disarankan di Canvas
+        # Ini mengasumsikan 'default-app-id' adalah nama aplikasi Firebase Anda atau Anda mendapatkan APP_ID dari config.py
+        user_doc_ref = db.collection(f'artifacts/{app_id_from_config}/public/data/users').document(user_id)
+
+
+        doc = user_doc_ref.get()
+
+        if not doc.exists:
+            # New user subscribing
+            user_doc_ref.set({
+                'user_id': user_id,
+                'username': username,
+                'subscribed_to_reminders': True,
+                'subscribed_at': firebase_admin.firestore.SERVER_TIMESTAMP, # CORRECTED: Use firebase_admin.firestore.SERVER_TIMESTAMP
+                'last_interaction': firebase_admin.firestore.SERVER_TIMESTAMP
+            })
+            await update.message.reply_text(
+                "Anda telah berhasil berlangganan pengingat! ✨"
+                "\nSaya akan mengirimkan pengingat secara berkala. "
+                "Anda dapat membatalkan langganan kapan saja dengan perintah /unsubscribe_pengingat."
+            )
+            logger.info(f"Pengguna baru {user_id} ({username}) berhasil berlangganan pengingat.")
+        else:
+            # Existing user, update subscription status
+            user_doc_ref.update({
+                'subscribed_to_reminders': True,
+                'last_interaction': firebase_admin.firestore.SERVER_TIMESTAMP
+            })
+            await update.message.reply_text(
+                "Anda sudah berlangganan pengingat! 👍"
+                "\nSelamat menikmati pengingat dari saya. "
+                "Anda dapat membatalkan langganan kapan saja dengan perintah /unsubscribe_pengingat."
+            )
+            logger.info(f"Pengguna {user_id} ({username}) sudah berlangganan, status diperbarui.")
+
+    except Exception as e:
+        logger.error(f"Gagal berlangganan pengingat untuk {user_id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            "Maaf, terjadi kesalahan saat mencoba mendaftarkan Anda untuk pengingat. Mohon coba lagi nanti.\n"
+            "(Detail kesalahan telah dicatat untuk pengembang)"
+        )
+
+async def unsubscribe_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the /unsubscribe_pengingat command to unsubscribe a user from reminders."""
+    if db is None:
+        await update.message.reply_text(
+            "Maaf, bot sedang mengalami masalah teknis (database tidak tersedia). Mohon coba lagi nanti."
+        )
+        logger.error("Database client is not initialized for unsubscribe.")
+        return
+
+    user = update.effective_user
+    user_id = str(user.id)
+    username = user.full_name or user.username or "Anonim"
+
+    logger.info(f"Percobaan pembatalan langganan pengingat oleh pengguna: {username} (ID: {user_id})")
+
+    try:
+        app_id_from_config = firebase_admin._apps['[DEFAULT]'].name if firebase_admin._apps else 'default-app-id'
+        user_doc_ref = db.collection(f'artifacts/{app_id_from_config}/public/data/users').document(user_id)
+
+        doc = user_doc_ref.get()
+
+        if doc.exists and doc.to_dict().get('subscribed_to_reminders'):
+            # PENTING: Metode .update() dari Firebase Admin Python SDK adalah SINKRON
+            # Jangan gunakan 'await' di sini.
+            user_doc_ref.update({
+                'subscribed_to_reminders': False,
+                'last_interaction': firebase_admin.firestore.SERVER_TIMESTAMP
+            })
+            await update.message.reply_text(
+                "Anda telah berhasil berhenti berlangganan pengingat. 👋"
+                "\nAnda tidak akan menerima pesan pengingat lagi dari saya. "
+                "Anda dapat berlangganan kembali kapan saja dengan perintah /subscribe_pengingat."
+            )
+            logger.info(f"Pengguna {user_id} ({username}) berhasil berhenti berlangganan pengingat.")
+        else:
+            await update.message.reply_text(
+                "Anda saat ini tidak berlangganan pengingat. "
+                "Untuk berlangganan, gunakan perintah /subscribe_pengingat. 😊"
+            )
+            logger.info(f"Pengguna {user_id} ({username}) mencoba berhenti langganan tetapi tidak berlangganan.")
+
+    except Exception as e:
+        logger.error(f"Gagal membatalkan langganan pengingat untuk {user_id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            "Maaf, terjadi kesalahan saat mencoba membatalkan langganan Anda. Mohon coba lagi nanti.\n"
+            "(Detail kesalahan telah dicatat untuk pengembang)"
+        )
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mencari jadwal berdasarkan kata kunci dari file jadwal.json."""
@@ -655,8 +773,9 @@ async def post_init(application: Application):
         BotCommand("jadwal", "Menampilkan seluruh jadwal pelajaran"),
         BotCommand("jadwal_hari_ini", "Menampilkan jadwal untuk hari ini"),
         BotCommand("tautan", "Menampilkan semua tautan penting"),
-        BotCommand("cari",
-                   "Menampilkan fitur pencarian materi/pemateri/status"),
+        BotCommand("subscribe_pengingat", "Berlangganan pengingat jadwal personal"),
+        BotCommand("unsubscribe_pengingat", "Berhenti untuk berlangganan pengingat jadwal personal"),
+        BotCommand("cari", "Menampilkan fitur pencarian materi/pemateri/status"),
         BotCommand("sendtest", "Mengirim pesan percobaan ke channel")
     ])
 
@@ -692,40 +811,11 @@ def main() -> None:
                        send_test_message,
                        filters=filters.User(ADMIN_USER_ID)))
 
+    application.add_handler(CommandHandler("subscribe_pengingat", subscribe_reminders))
+    application.add_handler(CommandHandler("unsubscribe_pengingat", unsubscribe_reminders))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # --- PENTING: Ganti run_polling dengan run_webhook untuk Cloud Run ---
-
-    # Path tempat Telegram akan mengirim update (misalnya, yourservice.run.app/webhook)
-    WEBHOOK_PATH = "/webhook"
-
-        # Dapatkan port dari variabel lingkungan yang disediakan oleh Cloud Run
-        # Default ke 8080 jika tidak disetel (ini penting untuk Cloud Run)
-    PORT = int(os.environ.get("PORT", 8080))
-
-        # URL publik yang akan digunakan Telegram untuk mengirim update
-        # Di Cloud Run, URL ini dinamis. Kita akan menyetelnya *setelah* deployment.
-        # PTB akan mendengarkan di `listen_address` dan `port`.
-        # `url_path` adalah bagian path di URL yang akan kita da daftarkan ke Telegram.
-        # `webhook_url` adalah URL LENGKAP yang akan Anda daftarkan ke Telegram.
-        # Di Cloud Run, URL ini didapatkan setelah service di-deploy.
-        # Untuk saat ini, kita bisa membiarkannya kosong karena kita akan menyetelnya secara manual ke Telegram.
-        # PTB hanya perlu tahu *cara mendengarkan* request.
-
-        # Jalankan aplikasi dalam mode webhook
-        # Parameter:
-        #   listen: IP yang akan didengarkan oleh server (0.0.0.0 agar bisa diakses dari luar container)
-        #   port: Port yang akan didengarkan (dari variabel lingkungan Cloud Run)
-        #   url_path: Path di mana bot akan menerima update Telegram (misalnya '/webhook')
-        #   webhook_url: URL lengkap yang akan didaftarkan ke Telegram (kita akan setel ini secara eksternal)
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-            # Kita tidak perlu menyetel webhook_url di sini jika akan disetel secara eksternal (disarankan untuk Cloud Run)
-            # Anda akan mengatur URL webhook ke Telegram secara terpisah setelah deployment.
-            # Contoh: https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://[URL-CLOUDRUN-ANDA]/webhook
-    )
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
