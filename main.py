@@ -9,11 +9,14 @@ import os
 import config
 from config import db, firebase_admin # Pastikan Anda mengimpor 'db' dari config.py
 from config import TOKEN, CHANNEL_ID, ADMIN_USER_ID, UNIVERSAL_ZOOM_LINK, DRIVE_LINK, MESSAGE_TEXT, FIREBASE_SERVICE_ACCOUNT_KEY_PATH, APP_ID
+from firebase_admin import credentials, initialize_app
+from firebase_admin import firestore # <-- Ini yang Anda butuhkan
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, constants, BotCommand, Bot
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     filters,
 )
@@ -133,6 +136,87 @@ async def send_message_to_channel(message_text: str,
     except Exception as e:
         logging.error(f"Gagal mengirim pesan ke channel: {e}", exc_info=True)
 
+# --- FUNGSI BARU UNTUK MENERIMA UMPAN BALIK ---
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Meminta pengguna untuk mengirim umpan balik setelah perintah /feedback."""
+    user = update.effective_user
+    logger.info(f"Perintah /feedback diterima dari {user.id} ({user.full_name})")
+        
+    await update.message.reply_text(
+        "Silakan ketik umpan balik atau pertanyaan Anda setelah pesan ini. Saya akan meneruskannya kepada pengembang. Terima kasih!"
+        "\n\nUntuk membatalkan, kirim /cancel."
+    )
+    # Menyetel status pengguna agar pesan berikutnya ditangani sebagai umpan balik
+    context.user_data['state'] = 'awaiting_feedback'
+
+async def receive_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menerima dan menyimpan umpan balik dari pengguna ke Firestore."""
+    user = update.effective_user
+    user_id = str(user.id)
+        
+    # Periksa apakah pengguna sedang dalam status menunggu umpan balik
+    if context.user_data.get('state') == 'awaiting_feedback':
+        feedback_text = update.message.text
+        logger.info(f"Umpan balik diterima dari {user.id} ({user.full_name}): {feedback_text[:50]}...") # Log 50 karakter pertama
+
+        try:
+            # Dapatkan APP_ID dari config.py juga jika Anda ingin menggunakannya
+            # from config import APP_ID # Tambahkan ini jika APP_ID tidak diakses secara global di sini
+            # Contoh penggunaan APP_ID (pastikan APP_ID diatur di config.py)
+            app_id_from_config = firebase_admin._apps['[DEFAULT]'].name if firebase_admin._apps else 'default-app-id' # Menggunakan nama aplikasi default atau fallback# DEBUGGING: Cetak APP_ID yang digunakan
+            logger.debug(f"Menggunakan APP_ID: {app_id_from_config}")# Path ke koleksi umpan balik: artifacts/{APP_ID}/public/data/feedback
+            # Ini akan membuat dokumen baru untuk setiap umpan balik
+            feedback_collection_ref = db.collection(f'artifacts/{app_id_from_config}/public/data/feedback')
+                
+            feedback_data = {
+                'user_id': user_id,
+                'username': user.full_name or user.username,
+                'feedback_text': feedback_text,
+                'received_at': firestore.SERVER_TIMESTAMP,
+                'status': 'new' # Status awal umpan balik
+            }
+                
+            feedback_collection_ref.add(feedback_data) # Gunakan add() untuk membuat dokumen baru secara otomatis
+                
+            await update.message.reply_text(
+                "Terima kasih atas umpan balik Anda! Pesan Anda telah berhasil diterima dan akan kami tinjau."
+            )
+            logger.info(f"Umpan balik dari {user.id} berhasil disimpan ke Firestore.")
+
+            # Opsional: Kirim notifikasi ke admin
+            if ADMIN_USER_ID and ADMIN_USER_ID != 0:
+                try:
+                    admin_message = (
+                        f"**Umpan Balik Baru Diterima!**\n\n"
+                        f"**Dari:** {user.full_name or user.username} (`{user_id}`)\n"
+                        f"**Umpan Balik:** {feedback_text}"
+                    )
+                    await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_message, parse_mode='Markdown')
+                    logger.info(f"Notifikasi umpan balik dikirim ke admin {ADMIN_USER_ID}.")
+                except Exception as admin_e:
+                    logger.error(f"Gagal mengirim notifikasi umpan balik ke admin {ADMIN_USER_ID}: {admin_e}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"Gagal menyimpan umpan balik dari {user.id}: {e}", exc_info=True)
+            await update.message.reply_text(
+                "Maaf, terjadi kesalahan saat menyimpan umpan balik Anda. Mohon coba lagi nanti."
+            )
+            
+        # Reset status pengguna setelah umpan balik diterima
+        del context.user_data['state']
+    # Jika bukan dalam status awaiting_feedback, biarkan MessageHandler lain menanganinya
+    # atau lewati (pass) jika ini adalah satu-satunya MessageHandler
+    else:
+        return
+
+async def cancel_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Membatalkan proses pengiriman umpan balik."""
+    if context.user_data.get('state') == 'awaiting_feedback':
+        del context.user_data['state']
+        await update.message.reply_text("Pengiriman umpan balik dibatalkan.")
+        logger.info(f"Pengiriman umpan balik dibatalkan oleh {update.effective_user.id}.")
+    else:
+        await update.message.reply_text("Anda tidak sedang dalam mode pengiriman umpan balik.")
 
 # --- FUNGSI SCHEDULER (untuk pengingat otomatis) ---
 # --- FUNGSI PEMBANTU
@@ -162,23 +246,42 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(jakarta_tz)
     today_name_en = now.strftime('%A').lower()  # e.g., 'monday', 'tuesday'
 
-    # Dapatkan instance bot untuk mengirim pesan personal
     bot_instance = context.bot
 
     # --- Bagian Baru: Ambil Pelanggan dari Firestore ---
     subscribed_users = []
     if db: # Pastikan db client sudah ada
         try:
-            # Gunakan APP_ID yang diimpor dari config.py
-            # Ini akan mencari data di artifacts/{APP_ID_ANDA}/public/data/users
-            users_ref = db.collection(f'artifacts/{APP_ID}/public/data/users')
+            # Dapatkan APP_ID dari config.py juga jika Anda ingin menggunakannya
+            # from config import APP_ID # Tambahkan ini jika APP_ID tidak diakses secara global di sini
+            # Contoh penggunaan APP_ID (pastikan APP_ID diatur di config.py)
+            app_id_from_config = firebase_admin._apps['[DEFAULT]'].name if firebase_admin._apps else 'default-app-id' # Menggunakan nama aplikasi default atau fallback# DEBUGGING: Cetak APP_ID yang digunakan
+            logger.debug(f"Menggunakan APP_ID: {app_id_from_config}")
+            # DEBUGGING: Cetak jalur koleksi lengkap
+            collection_path = f'artifacts/{app_id_from_config}/public/data/users'
+            logger.debug(f"Mengkueri koleksi: {collection_path}")
+
+            users_ref = db.collection(collection_path)
             
-            # Gunakan loop `for` biasa untuk iterasi StreamGenerator (synchronous iteration)
+            # DEBUGGING: Coba ambil semua dokumen tanpa filter 'where' untuk melihat apakah ada data sama sekali
+            # Ini hanya untuk debug, jangan tinggalkan di produksi
+            # all_docs_stream = users_ref.stream()
+            # for doc in all_docs_stream:
+            #     logger.debug(f"Ditemukan dokumen (tanpa filter): ID={doc.id}, Data={doc.to_dict()}")
+            # if not list(all_docs_stream): # Cek apakah ada data setelah streaming
+            #     logger.warning("Tidak ada dokumen yang ditemukan di koleksi ini sama sekali.")
+
+
             docs_stream = users_ref.where('subscribed_to_reminders', '==', True).stream()
             
             for doc in docs_stream:
                 user_data = doc.to_dict()
+                # DEBUGGING: Cetak ID dokumen dan data yang ditemukan
+                # logger.debug(f"Ditemukan dokumen cocok: ID={doc.id}, Data={user_data}")
                 if user_data: # Pastikan dokumen tidak kosong
+                    # DEBUGGING: Periksa tipe data dari 'subscribed_to_reminders'
+                    if 'subscribed_to_reminders' in user_data:
+                        logger.debug(f"subscribed_to_reminders untuk {doc.id}: {user_data['subscribed_to_reminders']} (Tipe: {type(user_data['subscribed_to_reminders'])})")
                     subscribed_users.append(user_data)
             logger.info(f"Ditemukan {len(subscribed_users)} pelanggan yang aktif.")
         except Exception as e:
@@ -223,6 +326,7 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
             reminder_key_60_min = f"sent_60_min_{today_name_en}_{item.get('pelajaran','')}_{item.get('waktu','')}"
             reminder_key_at_start = f"sent_at_start_{today_name_en}_{item.get('pelajaran','')}_{item.get('waktu','')}"
 
+            # Pastikan escape_markdown_v2 tersedia atau buat dummy
             escaped_pelajaran = escape_markdown_v2(item.get('pelajaran', ''))
             escaped_pengajar = escape_markdown_v2(item.get('pengajar', ''))
             escaped_waktu = escape_markdown_v2(item.get('waktu', ''))
@@ -251,12 +355,11 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                     "Kelas akan dimulai 60 menit lagi\\. Siapkan waktu dan catatan, anda dapat bergabung melalui tautan di bawah ini\\."
                 )
                 
-                # Kirim ke Channel
                 if CHANNEL_ID != 0:
                     await context.bot.send_message(
                         chat_id=CHANNEL_ID,
                         text=reminder_message_60_min,
-                        parse_mode=constants.ParseMode.MARKDOWN_V2,
+                        parse_mode=constants.MARKDOWN_V2,
                         reply_markup=reply_markup,
                         disable_web_page_preview=True
                     )
@@ -264,8 +367,6 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     logger.warning("CHANNEL_ID tidak valid (0), tidak dapat mengirim pengingat ke channel.")
 
-
-                # Kirim ke Pelanggan Personal
                 for user_data in subscribed_users:
                     user_tg_id = user_data.get('telegram_user_id')
                     if user_tg_id:
@@ -288,12 +389,11 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                     f"⏰ *Waktu :* {escaped_waktu} WIB\n\n"
                     f"Kelas {escaped_pelajaran} sudah dimulai\\. Ayo bergabung sekarang\\!"
                 )
-                # Kirim ke Channel
                 if CHANNEL_ID != 0:
                     await context.bot.send_message(
                         chat_id=CHANNEL_ID,
                         text=reminder_message_at_start,
-                        parse_mode=constants.ParseMode.MARKDOWN_V2,
+                        parse_mode=constants.MARKDOWN_V2,
                         reply_markup=reply_markup,
                         disable_web_page_preview=True
                     )
@@ -301,8 +401,6 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     logger.warning("CHANNEL_ID tidak valid (0), tidak dapat mengirim pengingat ke channel.")
 
-
-                # Kirim ke Pelanggan Personal
                 for user_data in subscribed_users:
                     user_tg_id = user_data.get('telegram_user_id')
                     if user_tg_id:
@@ -826,6 +924,8 @@ async def post_init(application: Application):
         BotCommand("subscribe_pengingat", "Berlangganan pengingat jadwal personal"),
         BotCommand("unsubscribe_pengingat", "Berhenti untuk berlangganan pengingat jadwal personal"),
         BotCommand("cari", "Menampilkan fitur pencarian materi/pemateri/status"),
+        BotCommand("feedback", "Kirim umpan balik (saran dan masukan) atau pertanyaan kepada pengembang"),
+        BotCommand("cancel_feedback", "Batalkan proses saat ini (misal: pengiriman umpan balik)"),
         BotCommand("sendtest", "Mengirim pesan percobaan ke channel")
     ])
 
@@ -856,14 +956,14 @@ def main() -> None:
     application.add_handler(CommandHandler("jadwal_hari_ini", jadwal_hari_ini))
     application.add_handler(CommandHandler("tautan", tautan))
     application.add_handler(CommandHandler("cari", search_command))
-    application.add_handler(
-        CommandHandler("sendtest",
-                       send_test_message,
-                       filters=filters.User(ADMIN_USER_ID)))
-
+    application.add_handler(CommandHandler("sendtest", send_test_message, filters=filters.User(ADMIN_USER_ID)))
+    application.add_handler(CommandHandler("feedback", feedback_command))
+    application.add_handler(CommandHandler("cancel_feedback", cancel_feedback))
     application.add_handler(CommandHandler("subscribe_pengingat", subscribe_reminders))
     application.add_handler(CommandHandler("unsubscribe_pengingat", unsubscribe_reminders))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_feedback))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
